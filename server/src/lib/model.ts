@@ -1,5 +1,5 @@
 import * as request from 'request-promise-native';
-import { LanguageStats, Sentence } from 'common';
+import { LanguageStats, SentenceCount, Sentence } from 'common';
 import DB from './model/db';
 import { DBClip } from './model/db/tables/clip-table';
 import lazyCache from './lazy-cache';
@@ -7,9 +7,12 @@ import lazyCache from './lazy-cache';
 const locales = require('locales/all.json') as string[];
 const contributableLocales = require('locales/contributable.json') as string[];
 
+const HOUR_IN_SECONDS = 3600;
+const DEFAULT_TARGET_SENTENCE_COUNT = 5000;
+
 // based on the latest dataset
-const AVG_CLIP_SECONDS = 4.896;
-const AVG_CLIP_SECONDS_PER_LOCALE: { [locale: string]: number } = {
+const AVERAGE_CLIP_SECONDS = 4.896;
+const AVERAGE_CLIP_SECONDS_PER_LOCALE: { [locale: string]: number } = {
   en: 5.142,
   fa: 4.019,
   fr: 4.983,
@@ -99,16 +102,18 @@ const AVG_CLIP_SECONDS_PER_LOCALE: { [locale: string]: number } = {
   ig: 6.494,
 };
 
-const getAvgSecondsPerClip = (locale: string) =>
-  AVG_CLIP_SECONDS_PER_LOCALE[locale] || AVG_CLIP_SECONDS;
+const getAverageSecondsPerClip = (locale: string) =>
+  AVERAGE_CLIP_SECONDS_PER_LOCALE[locale] || AVERAGE_CLIP_SECONDS;
 
 function fetchLocalizedPercentagesByLocale() {
   return request({
     uri: 'https://pontoon.mozilla.org/graphql?query={project(slug:%22common-voice%22){localizations{totalStrings,approvedStrings,locale{code}}}}',
     method: 'GET',
     json: true,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
   }).then(({ data }: any) =>
     data.project.localizations.reduce(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (obj: { [locale: string]: number }, l: any) => {
         obj[l.locale.code] = Math.round(
           (100 * l.approvedStrings) / l.totalStrings
@@ -185,17 +190,6 @@ export default class Model {
     await this.db.saveClip(clipData);
   }
 
-  getValidatedHours = lazyCache(
-    'validated-hours',
-    async () => {
-      const english = (await this.db.getValidClipCount(['en']))[0];
-      return Math.round(
-        ((english ? english.count : 0) * getAvgSecondsPerClip('en')) / 3600
-      );
-    },
-    DAY
-  );
-
   getLanguageStats = lazyCache(
     'all-language-stats',
     async (): Promise<LanguageStats> => {
@@ -203,19 +197,38 @@ export default class Model {
         locale => !contributableLocales.includes(locale)
       );
 
-      function indexCountByLocale(
-        rows: { locale: string; count: number; target_sentence_count: number }[]
-      ): {
-        [locale: string]: any;
+      function indexCountByLocale(rows: { locale: string; count: number }[]): {
+        [locale: string]: number;
       } {
         return rows.reduce(
           (
-            obj: { [locale: string]: any },
-            { count, locale, target_sentence_count }: any
+            obj: { [locale: string]: number },
+            { count, locale }: { count: number; locale: string }
+          ) => {
+            obj[locale] = count;
+            return obj;
+          },
+          {}
+        );
+      }
+
+      function indexSentenceCountByLocale(
+        rows: { locale: string; count: number; target_sentence_count: number }[]
+      ): {
+        [locale: string]: SentenceCount;
+      } {
+        return rows.reduce(
+          (
+            obj: { [locale: string]: SentenceCount },
+            {
+              count,
+              locale,
+              target_sentence_count,
+            }: { locale: string; count: number; target_sentence_count: number }
           ) => {
             obj[locale] = {
-              current_count: count,
-              target_sentence_count: target_sentence_count,
+              currentCount: count,
+              targetSentenceCount: target_sentence_count,
             };
             return obj;
           },
@@ -228,32 +241,59 @@ export default class Model {
         sentenceCounts,
         validClipsCounts,
         speakerCounts,
+        dailySpeakerCounts,
       ] = await Promise.all([
         fetchLocalizedPercentagesByLocale(),
         this.db
           .getSentenceCountByLocale(inProgressLocales)
-          .then(indexCountByLocale),
+          .then(indexSentenceCountByLocale),
         this.db
           .getValidClipCount(contributableLocales)
           .then(indexCountByLocale),
         this.db.getSpeakerCount(contributableLocales).then(indexCountByLocale),
+        this.db
+          .getDailySpeakerCount(contributableLocales)
+          .then(indexCountByLocale),
       ]);
 
-      return {
-        inProgress: inProgressLocales.map(locale => ({
-          locale,
-          localizedPercentage: localizedPercentages[locale] || 0,
-          sentencesCount: sentenceCounts[locale] || 0,
-        })),
-        launched: contributableLocales.map(locale => ({
-          locale,
-          seconds: Math.floor(
-            (validClipsCounts[locale]?.current_count || 0) *
-              getAvgSecondsPerClip(locale)
-          ),
-          speakers: speakerCounts[locale] || 0,
-        })),
+      const countToHours = (locale: string, count?: number) => {
+        if (!count || count === 0) {
+          return 0;
+        }
+
+        return Math.ceil(
+          (count * getAverageSecondsPerClip(locale)) / HOUR_IN_SECONDS
+        );
       };
+
+      const launched = contributableLocales.map(locale => {
+        const recordedHours = countToHours(locale, dailySpeakerCounts[locale]);
+        const validatedHours = countToHours(locale, validClipsCounts[locale]);
+        const speakersCount = speakerCounts[locale] || 0;
+        const sentencesCount = sentenceCounts[locale] || {
+          currentCount: 0,
+          targetSentenceCount: DEFAULT_TARGET_SENTENCE_COUNT,
+        };
+
+        return {
+          locale,
+          recordedHours,
+          validatedHours,
+          speakersCount,
+          sentencesCount,
+        };
+      });
+
+      const inProgress = inProgressLocales.map(locale => ({
+        locale,
+        localizedPercentage: localizedPercentages[locale] || 0,
+        sentencesCount: sentenceCounts[locale] || {
+          currentCount: 0,
+          targetSentenceCount: DEFAULT_TARGET_SENTENCE_COUNT,
+        },
+      }));
+
+      return { launched, inProgress };
     },
     DAY
   );
@@ -263,8 +303,8 @@ export default class Model {
     async (locale: string) =>
       (await this.db.getClipsStats(locale)).map(stat => ({
         ...stat,
-        total: Math.round(stat.total * getAvgSecondsPerClip(locale)),
-        valid: Math.round(stat.valid * getAvgSecondsPerClip(locale)),
+        total: Math.round(stat.total * getAverageSecondsPerClip(locale)),
+        valid: Math.round(stat.valid * getAverageSecondsPerClip(locale)),
       })),
     DAY / 2
   );

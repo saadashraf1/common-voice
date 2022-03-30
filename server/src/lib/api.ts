@@ -554,6 +554,7 @@ export default class API {
 
       response.json(json);
     } catch (e) {
+      console.error(e);
       next(new Error('Something went wrong sending language request email'));
     }
   };

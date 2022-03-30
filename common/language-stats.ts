@@ -1,20 +1,21 @@
+export type SentenceCount = {
+  currentCount: number;
+  targetSentenceCount: number;
+};
+
 export type BaseLanguage = {
   locale: string;
-};
-type SentenceCount = {
-  current_count: number;
-  target_sentence_count: number;
-};
-export type InProgressLanguage = BaseLanguage & {
-  localizedPercentage: number;
   sentencesCount: SentenceCount;
 };
 
+export type InProgressLanguage = BaseLanguage & {
+  localizedPercentage: number;
+};
+
 export type LaunchedLanguage = BaseLanguage & {
-  seconds: number;
-  speakers: {
-    current_count: number;
-  };
+  recordedHours: number;
+  validatedHours: number;
+  speakersCount: number;
 };
 
 export interface LanguageStats {
